@@ -2,6 +2,7 @@ import argparse
 import logging
 import json
 import os
+import sys
 from datetime import datetime
 from typing import Dict, Any, List
 
@@ -33,6 +34,34 @@ class PolicySimulator:
         self.policies = self._load_data(policy_file)
         self.users = self._load_data(user_file)
         self.context = self._load_data(context_file)
+        for label, data in (("policy", self.policies), ("user", self.users), ("context", self.context)):
+            if not isinstance(data, dict) or not data:
+                raise ValueError(f"Input error: {label} data is empty or invalid.")
+        self._validate_policy_times()
+        self._validate_context_time()
+
+    def _parse_time(self, value):
+        for fmt in ("%H:%M", "%H:%M:%S"):
+            try:
+                return datetime.strptime(str(value), fmt).time()
+            except ValueError:
+                continue
+        return None
+
+    def _validate_policy_times(self):
+        for policy in self.policies.get("policies", []) or []:
+            time_restrictions = (policy.get("conditions", {}) or {}).get("time", {}) or {}
+            for key in ("start_time", "end_time"):
+                if key in time_restrictions and time_restrictions.get(key) is not None:
+                    value = time_restrictions.get(key)
+                    if self._parse_time(value) is None:
+                        raise ValueError(f"Input error: Policy '{policy.get('name')}' has invalid time value '{value}' for {key}.")
+
+    def _validate_context_time(self):
+        context_data = self.context.get("context", {}) if isinstance(self.context.get("context", {}), dict) else {}
+        value = context_data.get("time", self.context.get("time"))
+        if value is not None and self._parse_time(value) is None:
+            raise ValueError(f"Input error: Context has invalid time value '{value}'.")
 
 
     def _load_data(self, file_path: str) -> Dict[str, Any]:
@@ -52,16 +81,13 @@ class PolicySimulator:
             return data
         except FileNotFoundError:
             logging.error(f"File not found: {file_path}")
-            print(f"Error: File not found: {file_path}")
-            return {}
+            raise ValueError(f"Input error: File not found: {file_path}")
         except json.JSONDecodeError:
             logging.error(f"Invalid JSON format in {file_path}")
-            print(f"Error: Invalid JSON format in {file_path}")
-            return {}
+            raise ValueError(f"Input error: Invalid JSON format in {file_path}")
         except Exception as e:
             logging.error(f"Error loading data from {file_path}: {e}")
-            print(f"Error loading data from {file_path}: {e}")
-            return {}
+            raise ValueError(f"Input error: Error loading data from {file_path}: {e}")
 
     def simulate_access(self, user_id: str) -> bool:
         """
@@ -75,69 +101,79 @@ class PolicySimulator:
         """
 
         if not self.policies or not self.users or not self.context:
-             print("Error: Data is not loaded.  Check that the policy, user, and context files are valid and accessible.")
-             logging.error("Data is not loaded.  Check that the policy, user, and context files are valid and accessible.")
-             return False
+             raise ValueError("Input error: Data is not loaded. Check that the policy, user, and context files are valid and accessible.")
 
         user_data = next((user for user in self.users.get("users", []) if user["id"] == user_id), None)
 
         if not user_data:
-            print(f"User with ID '{user_id}' not found.")
             logging.warning(f"User with ID '{user_id}' not found.")
-            return False
+            raise LookupError(f"User not found: '{user_id}'")
 
-        # Contextual information
+        # Contextual information. The evaluation time comes from the
+        # context file when it carries one; otherwise the wall clock is used.
         context_data = self.context.get("context", {})
-        current_time = datetime.now().time()
+        if not isinstance(context_data, dict):
+            context_data = {}
+        context_time_value = context_data.get("time", self.context.get("time"))
+        if context_time_value is not None:
+            current_time = self._parse_time(context_time_value)
+            logging.info(f"Using evaluation time from context file: {context_time_value}")
+            print(f"Using evaluation time from context file: {context_time_value}")
+        else:
+            current_time = datetime.now().time()
+            logging.info(f"Using current wall clock time: {current_time}")
+            print(f"Using current wall clock time: {current_time}")
 
-        # Default access: Denied
-        access_granted = False
-
+        matching = []
         for policy in self.policies.get("policies", []):
             if policy.get("status") != "enabled":
-                continue  # Skip disabled policies
+                continue
+            if user_id not in policy.get("users", []):
+                continue
+            conditions = policy.get("conditions", {}) or {}
+            time_condition_met = True
+            time_restrictions = conditions.get("time", {}) or {}
+            if time_restrictions:
+                start_time = self._parse_time(time_restrictions.get("start_time", "00:00"))
+                end_time = self._parse_time(time_restrictions.get("end_time", "23:59"))
+                if start_time is None or end_time is None:
+                    raise ValueError(f"Input error: Policy '{policy.get('name')}' has an invalid time value.")
+                if not (start_time <= current_time <= end_time):
+                    time_condition_met = False
+            location_condition_met = True
+            allowed_locations = conditions.get("location", [])
+            if allowed_locations:
+                user_location = context_data.get("location")
+                if user_location not in allowed_locations:
+                    location_condition_met = False
+            device_health_met = True
+            required_device_health = conditions.get("device_health", "")
+            if required_device_health:
+                current_device_health = context_data.get("device_health")
+                if current_device_health != required_device_health:
+                    device_health_met = False
+            if time_condition_met and location_condition_met and device_health_met:
+                matching.append(policy)
+            else:
+                logging.info(f"Policy '{policy.get('name')}' conditions not met for user '{user_id}'.")
 
-            # Check if the policy applies to the user
-            if user_id in policy.get("users", []):
-                conditions = policy.get("conditions", {})
+        # A matching block policy takes precedence and stops evaluation.
+        for policy in matching:
+            access_value = str((policy.get("grant_controls", {}) or {}).get("access", "")).strip().lower()
+            if access_value in ("block", "deny"):
+                logging.info(f"Policy '{policy.get('name')}' blocked access to user '{user_id}'.")
+                print(f"Policy '{policy.get('name')}' blocked access to user '{user_id}'.")
+                return False
 
-                # Check Time condition
-                time_condition_met = True
-                time_restrictions = conditions.get("time", {})
-
-                if time_restrictions:
-                    start_time = datetime.strptime(time_restrictions.get("start_time", "00:00"), "%H:%M").time()
-                    end_time = datetime.strptime(time_restrictions.get("end_time", "23:59"), "%H:%M").time()
-                    if not (start_time <= current_time <= end_time):
-                        time_condition_met = False
-
-                # Check Location condition
-                location_condition_met = True
-                allowed_locations = conditions.get("location", [])
-
-                if allowed_locations:
-                    user_location = context_data.get("location")
-                    if user_location not in allowed_locations:
-                        location_condition_met = False
-
-                # Check Device Health Condition
-                device_health_met = True
-                required_device_health = conditions.get("device_health", "")
-
-                if required_device_health:
-                    current_device_health = context_data.get("device_health")
-                    if current_device_health != required_device_health:
-                        device_health_met = False
-
-                # If all conditions are met, grant access based on the policy's grant control
-                if time_condition_met and location_condition_met and device_health_met:
-                    grant_controls = policy.get("grant_controls", {})
-                    if grant_controls.get("access") == "grant":
-                        access_granted = True
-                        logging.info(f"Policy '{policy.get('name')}' granted access to user '{user_id}'.")
-                        break  # Grant takes precedence, stop checking policies
-                    else:
-                        logging.info(f"Policy '{policy.get('name')}' applied but does not grant access to user '{user_id}'.")
+        access_granted = False
+        for policy in matching:
+            grant_controls = policy.get("grant_controls", {}) or {}
+            if str(grant_controls.get("access", "")).strip().lower() == "grant":
+                access_granted = True
+                logging.info(f"Policy '{policy.get('name')}' granted access to user '{user_id}'.")
+                break
+            else:
+                logging.info(f"Policy '{policy.get('name')}' applied but does not grant access to user '{user_id}'.")
 
         if not access_granted:
             logging.info(f"Access denied to user '{user_id}' based on configured policies.")
@@ -172,22 +208,27 @@ def main() -> None:
     args = parser.parse_args()
 
     # Input Validation
-    if not os.path.exists(args.policy_file):
-        print(f"Error: Policy file not found: {args.policy_file}")
-        logging.error(f"Policy file not found: {args.policy_file}")
-        return
-    if not os.path.exists(args.user_file):
-        print(f"Error: User file not found: {args.user_file}")
-        logging.error(f"User file not found: {args.user_file}")
-        return
-    if not os.path.exists(args.context_file):
-        print(f"Error: Context file not found: {args.context_file}")
-        logging.error(f"Context file not found: {args.context_file}")
-        return
+    for label, path in (("Policy", args.policy_file), ("User", args.user_file), ("Context", args.context_file)):
+        if not os.path.exists(path):
+            print(f"Input error: {label} file not found: {path}")
+            logging.error(f"{label} file not found: {path}")
+            sys.exit(1)
 
-
-    simulator = PolicySimulator(args.policy_file, args.user_file, args.context_file)
-    access_granted = simulator.simulate_access(args.user_id)
+    try:
+        simulator = PolicySimulator(args.policy_file, args.user_file, args.context_file)
+        access_granted = simulator.simulate_access(args.user_id)
+    except LookupError as e:
+        print(f"User not found: {args.user_id}")
+        logging.error(str(e))
+        sys.exit(1)
+    except ValueError as e:
+        message = str(e)
+        if message.startswith("Input error:"):
+            print(message)
+        else:
+            print(f"Input error: {message}")
+        logging.error(message)
+        sys.exit(1)
 
     if access_granted:
         print(f"Access granted to user '{args.user_id}'.")
