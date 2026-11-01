@@ -37,10 +37,12 @@ class PolicySimulator:
         for label, data in (("policy", self.policies), ("user", self.users), ("context", self.context)):
             if not isinstance(data, dict) or not data:
                 raise ValueError(f"Input error: {label} data is empty or invalid.")
+        # I validate every policy time up front, even for disabled policies and users I will never test. One bad value anywhere in the file stops the whole run, which is stricter than the evaluation below needs to be.
         self._validate_policy_times()
         self._validate_context_time()
 
     def _parse_time(self, value):
+        # I accept two clock shapes and nothing else. A policy that writes 8am or a full date fails validation at load, which is where I want that mistake, not halfway through a simulation.
         for fmt in ("%H:%M", "%H:%M:%S"):
             try:
                 return datetime.strptime(str(value), fmt).time()
@@ -58,6 +60,7 @@ class PolicySimulator:
                         raise ValueError(f"Input error: Policy '{policy.get('name')}' has invalid time value '{value}' for {key}.")
 
     def _validate_context_time(self):
+        # The context file has two shapes in the wild for this tool: wrapped under a context key and flat at the top. I read the time from the wrapped shape first and fall back to the flat one, and simulate_access repeats that same fallback for location and device health through context_data only, so a flat file with a location is read differently from a flat file with a time.
         context_data = self.context.get("context", {}) if isinstance(self.context.get("context", {}), dict) else {}
         value = context_data.get("time", self.context.get("time"))
         if value is not None and self._parse_time(value) is None:
@@ -103,6 +106,7 @@ class PolicySimulator:
         if not self.policies or not self.users or not self.context:
              raise ValueError("Input error: Data is not loaded. Check that the policy, user, and context files are valid and accessible.")
 
+        # A user entry with no id key raises KeyError here instead of reading as not found. The LookupError path only covers a well formed file that simply does not contain this user.
         user_data = next((user for user in self.users.get("users", []) if user["id"] == user_id), None)
 
         if not user_data:
@@ -128,6 +132,7 @@ class PolicySimulator:
         for policy in self.policies.get("policies", []):
             if policy.get("status") != "enabled":
                 continue
+            # Membership is an exact id match against the policy list. There are no groups, roles, or wildcards in this simulator, so a policy meant for a whole team has to name every person in it.
             if user_id not in policy.get("users", []):
                 continue
             conditions = policy.get("conditions", {}) or {}
@@ -138,6 +143,7 @@ class PolicySimulator:
                 end_time = self._parse_time(time_restrictions.get("end_time", "23:59"))
                 if start_time is None or end_time is None:
                     raise ValueError(f"Input error: Policy '{policy.get('name')}' has an invalid time value.")
+                # This window cannot cross midnight. A policy written as 22:00 to 06:00 matches nothing at all, because no time is both after the start and before the end, and nothing warns the policy author about it.
                 if not (start_time <= current_time <= end_time):
                     time_condition_met = False
             location_condition_met = True
@@ -158,6 +164,7 @@ class PolicySimulator:
                 logging.info(f"Policy '{policy.get('name')}' conditions not met for user '{user_id}'.")
 
         # A matching block policy takes precedence and stops evaluation.
+        # Block is decided in a separate first pass over the matches for a reason: if I granted in the same pass, the result would depend on the order policies happen to sit in the file. A matching block always wins here, whatever order the file uses.
         for policy in matching:
             access_value = str((policy.get("grant_controls", {}) or {}).get("access", "")).strip().lower()
             if access_value in ("block", "deny"):
@@ -165,6 +172,7 @@ class PolicySimulator:
                 print(f"Policy '{policy.get('name')}' blocked access to user '{user_id}'.")
                 return False
 
+        # No matching grant means denied. There is no default allow hiding in this simulator, so a user named in no policy and a user whose policies all fail their conditions land in the same place.
         access_granted = False
         for policy in matching:
             grant_controls = policy.get("grant_controls", {}) or {}
